@@ -35,6 +35,7 @@ struct FnFrame {
 struct Walk {
     fn_stack: Vec<FnFrame>,
     timeout_hits: Vec<(u32, Vec<FnFrame>)>,
+    timeout_calls: Vec<(u64, u32)>,
     stack_hits: Vec<(u32, Vec<FnFrame>)>,
     race_hits: Vec<(u32, Vec<FnFrame>)>,
     signals: Option<Vec<Box<str>>>,
@@ -43,6 +44,20 @@ struct Walk {
     duration_delta: Option<i64>,
     macrotask_zero: bool,
     macrotask_zeros: Vec<u32>,
+    aliases: std::collections::HashMap<String, &'static str>,
+}
+
+fn common_prefix(names: &[Box<str>]) -> Option<String> {
+    let first = names.first()?;
+    let mut end = first.len();
+    while end > 0 {
+        let cand = &first[..end];
+        if names.iter().all(|n| n.starts_with(cand)) {
+            return Some(cand.to_string());
+        }
+        end = first[..end].char_indices().rev().next().map(|(i, _)| i).unwrap_or(0);
+    }
+    None
 }
 
 impl Walk {
@@ -51,6 +66,55 @@ impl Walk {
     }
     fn exit_fn(&mut self) {
         self.fn_stack.pop();
+    }
+
+    fn bind_alias(&mut self, decl: &ast::VariableDeclarator, init: &Expression) {
+        let name = match &decl.id { ast::BindingPattern::BindingIdentifier(b) => b.name.to_string(), _ => return };
+        let builtin = match init {
+            Expression::StaticMemberExpression(m) => {
+                let prop = m.property.name.as_str();
+                let obj_is = |want: &str| matches!(&m.object, Expression::Identifier(i) if i.name == want);
+                if obj_is("Promise") && prop == "race" {
+                    "Promise.race"
+                } else if obj_is("window") && prop == "setTimeout" {
+                    "window.setTimeout"
+                } else {
+                    match prop {
+                        "getAttribute" => "getAttribute",
+                        "setTimeout" => "setTimeout",
+                        _ => return,
+                    }
+                }
+            }
+            Expression::Identifier(i) if i.name == "setTimeout" => "setTimeout",
+            _ => return,
+        };
+        self.aliases.insert(name, builtin);
+    }
+
+    fn callee_builtin(&self, callee: &Expression) -> Option<&'static str> {
+        match callee {
+            Expression::StaticMemberExpression(m) => {
+                let prop = m.property.name.as_str();
+                if matches!(&m.object, Expression::Identifier(i) if i.name == "Promise") && prop == "race" {
+                    Some("Promise.race")
+                } else if prop == "setTimeout" {
+                    Some("setTimeout")
+                } else if prop == "getAttribute" {
+                    Some("getAttribute")
+                } else {
+                    None
+                }
+            }
+            Expression::Identifier(i) => {
+                if i.name == "setTimeout" {
+                    Some("setTimeout")
+                } else {
+                    self.aliases.get(i.name.as_ref()).copied()
+                }
+            }
+            _ => None,
+        }
     }
 
     fn ancestors(&self) -> Vec<FnFrame> {
@@ -93,34 +157,33 @@ impl Walk {
             }
             Expression::AwaitExpression(a) => {
                 if let Expression::CallExpression(c) = &a.argument
-                    && let Expression::StaticMemberExpression(m) = &c.callee
-                        && m.property.name.as_str() == "race"
-                            && let Expression::Identifier(i) = &m.object
-                                && i.name == "Promise" {
-                                    self.race_hits.push((a.span().start, self.ancestors()));
-                                }
+                    && self.callee_builtin(&c.callee) == Some("Promise.race") {
+                    self.race_hits.push((a.span().start, self.ancestors()));
+                }
             }
             Expression::NewExpression(n) => {
                 if matches!(&n.callee, Expression::Identifier(i) if i.name == "Set")
                     && let Some(arg) = n.arguments.first().and_then(|a| a.as_expression())
                         && let Expression::ArrayExpression(arr) = arg
-                            && arr.elements.len() >= 8 {
+                            && arr.elements.len() >= 2
+                            && self.signals.is_none() {
+                                let mut names: Vec<Box<str>> = Vec::with_capacity(arr.elements.len());
                                 let mut all = true;
-                                let mut names = Vec::with_capacity(arr.elements.len());
                                 for el in &arr.elements {
                                     match el.as_expression() {
-                                        Some(Expression::StringLiteral(s)) if s.value.starts_with("dc_") => {
-                                            names.push(s.value["dc_".len()..].into());
-                                        }
+                                        Some(Expression::StringLiteral(s)) => names.push(s.value.as_str().into()),
                                         _ => {
                                             all = false;
                                             break;
                                         }
                                     }
                                 }
-                                if all && self.signals.is_none() {
-                                    self.signals = Some(names);
-                                }
+                                if all
+                                    && let Some(prefix) = common_prefix(&names)
+                                    && prefix.len() >= 2 {
+                                        let cut = prefix.len();
+                                        self.signals = Some(names.iter().map(|n| n[cut..].into()).collect());
+                                    }
                             }
             }
             Expression::StaticMemberExpression(m) => {
@@ -132,8 +195,8 @@ impl Walk {
                 }
             }
             Expression::CallExpression(c) => {
-                if let Expression::StaticMemberExpression(m) = &c.callee {
-                    if m.property.name.as_str() == "getAttribute" {
+                match self.callee_builtin(&c.callee) {
+                    Some("getAttribute") => {
                         for a in &c.arguments {
                             if let Some(Expression::StringLiteral(s)) = a.as_expression() {
                                 if s.value == "data-version-tag" {
@@ -144,20 +207,20 @@ impl Walk {
                             }
                         }
                     }
-                    if m.property.name.as_str() == "setTimeout"
-                        && matches!(&m.object, Expression::Identifier(i) if i.name.as_ref() == "window" || i.name.is_empty())
-                        && c.arguments.len() == 2
-                        && matches!(c.arguments[1].as_expression(), Some(Expression::NumericLiteral(z)) if z.value == 0.0)
-                    {
-                        self.macrotask_zeros.push(c.span().start);
+                    Some("setTimeout") | Some("window.setTimeout") => {
+                        for a in &c.arguments {
+                            if let Some(Expression::NumericLiteral(z)) = a.as_expression()
+                                && z.value >= 10.0 {
+                                    self.timeout_calls.push((z.value as u64, z.span.start));
+                                }
+                        }
+                        if c.arguments.len() == 2
+                            && matches!(c.arguments[1].as_expression(), Some(Expression::NumericLiteral(z)) if z.value == 0.0)
+                        {
+                            self.macrotask_zeros.push(c.span().start);
+                        }
                     }
-                }
-                if let Expression::Identifier(i) = &c.callee
-                    && i.name == "setTimeout"
-                        && c.arguments.len() == 2
-                        && matches!(c.arguments[1].as_expression(), Some(Expression::NumericLiteral(z)) if z.value == 0.0)
-                {
-                    self.macrotask_zeros.push(c.span().start);
+                    _ => {}
                 }
             }
             _ => {}
@@ -170,6 +233,7 @@ impl Walk {
             Statement::VariableDeclaration(d) => {
                 for x in &d.declarations {
                     if let Some(i) = &x.init {
+                        self.bind_alias(x, i);
                         walk_expr(i, self);
                     }
                 }
@@ -446,58 +510,6 @@ fn find_stack(w: &Walk) -> Option<(u32, u32, &[FnFrame])> {
     None
 }
 
-fn timeout_ms_of(src: &str, tpos: u32) -> u64 {
-    let bytes = src.as_bytes();
-    let tpos = tpos as usize;
-    let mut search_from = 0usize;
-    while let Some(rel) = src[search_from..].find("setTimeout") {
-        let p = search_from + rel;
-        if bytes.get(p + 10) != Some(&b'(') {
-            search_from = p + 10;
-            continue;
-        }
-        let mut depth = 0i32;
-        let mut q = p + 10;
-        let mut in_str: u8 = 0;
-        while q < bytes.len() {
-            let c = bytes[q];
-            if in_str != 0 {
-                if c == b'\\' {
-                    q += 2;
-                    continue;
-                }
-                if c == in_str {
-                    in_str = 0;
-                }
-            } else if c == b'"' || c == b'\'' || c == b'`' {
-                in_str = c;
-            } else if c == b'(' {
-                depth += 1;
-            } else if c == b')' {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            q += 1;
-        }
-        if depth == 0 && p + 10 < tpos && tpos < q {
-            let args = &src[p + 11..q];
-            let mut best = 0u64;
-            for part in args.rsplit(',') {
-                let t = part.trim();
-                if let Ok(v) = t.parse::<u64>()
-                    && v >= 10 {
-                        best = v;
-                        break;
-                    }
-            }
-            return best;
-        }
-        search_from = q.max(p + 10);
-    }
-    0
-}
 
 pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
     let allocator = Allocator::default();
@@ -508,6 +520,7 @@ pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
     let mut w = Walk {
         fn_stack: Vec::new(),
         timeout_hits: Vec::new(),
+        timeout_calls: Vec::new(),
         stack_hits: Vec::new(),
         race_hits: Vec::new(),
         signals: None,
@@ -516,6 +529,7 @@ pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
         duration_delta: None,
         macrotask_zero: false,
         macrotask_zeros: Vec::new(),
+        aliases: std::collections::HashMap::new(),
     };
     for s in &ret.program.body {
         walk_stmt(s, &mut w);
@@ -540,8 +554,14 @@ pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
             {
                 env.timing.macrotask_zero = true;
             }
+            env.timing.timeout_ms = w
+                .timeout_calls
+                .iter()
+                .filter(|&(_, p)| w.race_hits.iter().any(|&(r, _)| r <= *p && *p - r < 5000) || w.timeout_hits.iter().any(|&(t, _)| t <= *p && *p - t < 5000))
+                .map(|&(v, _)| v)
+                .max()
+                .unwrap_or(0);
             env.stack = Some(StackFacts { fname, line, col_error, col_race });
-            env.timing.timeout_ms = w.timeout_hits.iter().map(|&(p, _)| p).max().map(|p| timeout_ms_of(src, p)).unwrap_or(0);
         }
     }
     Some(env)

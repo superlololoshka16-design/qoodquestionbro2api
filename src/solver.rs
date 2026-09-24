@@ -60,8 +60,9 @@ pub fn token(js: &str, ua: &str, facts: &Facts, duration: u64) -> Result<String,
     p.push_str(&sha::sha256_b64(ua.as_bytes()));
     p.push('"');
     for probe in &m.probes {
-        let v = probe.value.or_else(|| probe.snapshot_value())
-            .ok_or_else(|| flow::FlowErr::Read("проба вне снапшота".into()))?;
+        let v = probe
+            .value
+            .ok_or_else(|| flow::FlowErr::Read("проба не решается структурно".into()))?;
         p.push_str(",\"");
         let num = jsnum::format_js_num(v);
         p.push_str(&sha::sha256_b64(num.as_bytes()));

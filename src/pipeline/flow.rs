@@ -76,135 +76,136 @@ pub struct Probe {
     pub value: Option<f64>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ProbeShape {
-    InnerHtml { base: f64 },
-    Layout,
-    JsaIframe,
-    Checks,
+pub enum CheckVal {
+    True,
+    False,
+    Unknown,
 }
 
-impl Probe {
-    pub fn shape(&self) -> Option<ProbeShape> {
-        let joined = self.env_descs().join("\n");
-        if joined.contains("innerHTML") && joined.contains("querySelectorAll") {
-            let base = self.base.or_else(|| self.metric_base());
-            return base.map(|b| ProbeShape::InnerHtml { base: b });
-        }
-        if joined.contains("offsetWidth") || joined.contains("getBoundingClientRect") || joined.contains("scrollHeight") {
-            return Some(ProbeShape::Layout);
-        }
-        if joined.contains("#jsa") {
-            return Some(ProbeShape::JsaIframe);
-        }
-        if !self.reads.is_empty() {
-            return Some(ProbeShape::Checks);
-        }
-        None
-    }
-
-    fn metric_base(&self) -> Option<f64> {
-        for r in &self.reads {
-            if let Read::Env { desc } = r {
-                let pat = "String(";
-                let mut from = 0;
-                while let Some(q) = desc[from..].find(pat) {
-                    let start = from + q + pat.len();
-                    let rest = &desc[start..];
-                    let take = rest.chars().take_while(|c| c.is_ascii_digit()).count();
-                    if take > 0
-                        && let Ok(v) = rest[..take].parse::<f64>()
-                    {
-                        return Some(v);
-                    }
-                    from = start;
-                }
-            }
-        }
-        None
-    }
-
-    fn env_descs(&self) -> Vec<&str> {
-        self.reads
-            .iter()
-            .filter_map(|r| match r {
-                Read::Env { desc } => Some(desc.as_str()),
-                Read::NavUa => None,
-            })
-            .collect()
-    }
-
-    fn html_literal(&self) -> Option<String> {
-        for r in &self.reads {
-            if let Read::Env { desc } = r {
-                if let Some(q) = desc.find("\"<") {
-                    let rest = &desc[q + 1..];
-                    if let Some(end) = rest.find('"') {
-                        return Some(rest[..end].to_string());
-                    }
-                }
-                if let Some(q) = desc.find("= <") {
-                    let rest = &desc[q + 2..];
-                    if let Some(end) = rest.find(';') {
-                        return Some(rest[..end].trim().to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    pub fn snapshot_value(&self) -> Option<f64> {
-        match self.shape()? {
-            ProbeShape::InnerHtml { base } => {
-                let html = self.html_literal()?;
-                let (len, qsa) = *INNERHTML_SNAP.get(html.as_str())?;
-                Some(base + len * qsa)
-            }
-            ProbeShape::Layout => {
-                let styled = self.env_descs().iter().any(|d| d.contains("cssText"));
-                let checks = if styled { LAYOUT_STYLED_SNAP } else { LAYOUT_DETACHED_SNAP };
-                self.base.map(|b| b + checks)
-            }
-            ProbeShape::JsaIframe => Some(JSA_IFRAME_SNAP),
-            ProbeShape::Checks => {
-                let sum: f64 = self.env_descs().iter().map(|d| check_truth(d)).sum();
-                self.base.map(|b| b + sum)
-            }
-        }
-    }
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeCtx {
+    pub attached_styled: bool,
 }
 
-
-static INNERHTML_SNAP: std::sync::LazyLock<std::collections::HashMap<&'static str, (f64, f64)>> =
-    std::sync::LazyLock::new(|| {
-        std::collections::HashMap::from([
-            ("<div><div></div><div></div", (33.0, 3.0)),
-            ("<p><div></p><p></div", (32.0, 4.0)),
-            ("<li><div></li><li></div", (29.0, 3.0)),
-            ("<br><div></br><br></div", (23.0, 4.0)),
-        ])
+fn has_prop(sx: &Sx, prop: &str) -> bool {
+    let mut hit = false;
+    walk_sx(sx, &mut |s| {
+        if let Sx::Member { prop: p, .. } = s
+            && p == prop
+        {
+            hit = true;
+        }
     });
+    hit
+}
 
-const LAYOUT_STYLED_SNAP: f64 = 5.0;
-const LAYOUT_DETACHED_SNAP: f64 = 0.0;
-const JSA_IFRAME_SNAP: f64 = 5465.0;
+fn has_member(sx: &Sx, root: &str, prop: &str) -> bool {
+    let mut hit = false;
+    walk_sx(sx, &mut |s| {
+        if let Sx::Member { obj, prop: p } = s
+            && p == prop
+                && let Sx::Ref(r) = obj.as_ref()
+                    && r == root
+        {
+            hit = true;
+        }
+    });
+    hit
+}
 
-fn check_truth(desc: &str) -> f64 {
-    if desc.starts_with("body:") {
-        return 0.0;
+fn has_call(sx: &Sx, prop: &str) -> bool {
+    let mut hit = false;
+    walk_sx(sx, &mut |s| {
+        if let Sx::Call { callee, .. } = s {
+            match callee.as_ref() {
+                Sx::Member { prop: p, .. } if p == prop => hit = true,
+                Sx::Ref(r) if r == prop => hit = true,
+                _ => {}
+            }
+        }
+    });
+    hit
+}
+
+fn has_str(sx: &Sx, needle: &str) -> bool {
+    let mut hit = false;
+    walk_sx(sx, &mut |s| {
+        if let Sx::Str(t) = s
+            && t == needle
+        {
+            hit = true;
+        }
+    });
+    hit
+}
+
+fn is_self_plus_k(sx: &Sx) -> bool {
+    let Sx::Bin { op: "===", l, r } = sx else { return false };
+    let Sx::Bin { op: "+", l: a, r: b } = r.as_ref() else { return false };
+    matches!(b.as_ref(), Sx::Num(n) if *n != 0.0) && render_sx(a) == render_sx(l)
+}
+
+// Значение чека выводится из ФОРМЫ AST-узла (web-платформа детерминирована).
+// Неизвестная форма → Unknown → честный отказ, никакого угадывания.
+pub fn check_value(c: &Sx, ctx: ProbeCtx) -> CheckVal {
+    use CheckVal::*;
+    if let Some(b) = truthy(c) {
+        return if b { True } else { False };
     }
-    if desc.contains("contentWindow") || desc.contains("window.top") || desc.contains("navigator.webdriver") {
-        return 0.0;
+    if is_self_plus_k(c) {
+        return False;
     }
-    if desc.contains("isSealed") {
-        return 0.0;
+    if has_member(c, "navigator", "webdriver") {
+        return False;
     }
-    if desc.contains("children.length") && desc.contains("+ 1") {
-        return 0.0;
+    if has_call(c, "isSealed") {
+        return False;
     }
-    1.0
+    if has_prop(c, "contentWindow") && has_prop(c, "srcdoc") {
+        return False;
+    }
+    if has_call(c, "endsWith") && has_member(c, "window", "top") {
+        return False;
+    }
+    if has_call(c, "getComputedStyle") && has_call(c, "getPropertyValue") {
+        return True;
+    }
+    if has_prop(c, "offsetWidth")
+        || has_prop(c, "offsetHeight")
+            || has_call(c, "getBoundingClientRect")
+                || has_prop(c, "scrollHeight")
+    {
+        return if ctx.attached_styled { True } else { False };
+    }
+    if has_str(c, "[native code]") && has_call(c, "includes") {
+        return True;
+    }
+    if has_str(c, "[object Window]") {
+        return True;
+    }
+    if has_str(c, "NodeList") {
+        return True;
+    }
+    if matches!(c, Sx::Un { op: "!", .. }) && has_call(c, "isArray") && has_call(c, "querySelectorAll") {
+        return True;
+    }
+    if has_prop(c, "captureStackTrace") {
+        return True;
+    }
+    if let Sx::Bin { op: "instanceof", .. } = c {
+        return True;
+    }
+    if let Sx::Bin { op: "===", l, r } = c {
+        let is_win = |s: &Sx| matches!(s, Sx::Ref(w) if w == "window");
+        let is_fncall = |s: &Sx| {
+            matches!(s, Sx::Call { callee, args } if args.is_empty() && matches!(callee.as_ref(), Sx::Fn { .. }))
+        };
+        if (is_fncall(l) && is_win(r)) || (is_win(l) && is_fncall(r)) {
+            return True;
+        }
+    }
+    Unknown
 }
 
 #[derive(Debug, Clone)]
@@ -968,12 +969,16 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
     tr.expr(checksum_expr).map_err(|e| FlowErr::Read(format!("перевод checksum: {e}")))?;
     let t = tr.finish();
     let simp = mba::simplify(&t.recexpr);
+    // egg-канон → cranelift-код ОДИН раз на full_hash, дальше кэш. rotation-цикл
+    // ниже гоняет eval до n раз — нативный call вместо интерпретации.
+    let jit = crate::pipeline::jit::compile_cached(simp.report.full_hash, &simp.program).ok();
 
     let vals: Vec<f64> = orig.iter().map(|s| crate::core::jsnum::js_parse_int(s)).collect();
     let delta_i = delta as i64;
     let mut buf = vec![0f64; t.var_args.len().max(1)];
     let mut rot_k: Option<usize> = None;
     let mut best: Option<(usize, f64)> = None;
+    let mut jit_ok: Option<bool> = None;
     for k in 0..n {
         for (vi, &a) in t.var_args.iter().enumerate() {
             let idx = if left {
@@ -983,7 +988,17 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
             };
             buf[vi] = vals[idx];
         }
-        let v = simp.program.eval(&buf);
+        // Канарейка на реальных данных: первая итерация считает и jit, и интерпретатор.
+        // Расхождение бит-в-бит → jit отключается на весь цикл, fallback интерпретатор.
+        let v = match (&jit, jit_ok) {
+            (Some(j), None) => {
+                let iv = simp.program.eval(&buf);
+                jit_ok = Some(j.call(&buf).to_bits() == iv.to_bits());
+                iv
+            }
+            (Some(j), Some(true)) => j.call(&buf),
+            _ => simp.program.eval(&buf),
+        };
         if v == target {
             rot_k = Some(k);
             break;
@@ -1319,10 +1334,35 @@ fn extract_probes(body: &[Sx]) -> Result<(bool, Vec<Probe>), FlowErr> {
     Ok((ua_first, probes))
 }
 
+fn probe_ctx(fn_body: Option<&[Sx]>) -> ProbeCtx {
+    let mut ctx = ProbeCtx::default();
+    if let Some(body) = fn_body {
+        let seq = Sx::Seq(body.to_vec());
+        let mut styled = false;
+        let mut attached = false;
+        walk_sx(&seq, &mut |s| {
+            if let Sx::Assign { target, .. } = s
+                && let Sx::Member { prop, .. } = target.as_ref()
+                    && prop == "cssText"
+            {
+                styled = true;
+            }
+            if let Sx::Call { callee, .. } = s
+                && let Sx::Member { prop, .. } = callee.as_ref()
+                    && prop == "appendChild"
+            {
+                attached = true;
+            }
+        });
+        ctx.attached_styled = styled && attached;
+    }
+    ctx
+}
+
 fn classify_probe(sx: &Sx) -> Option<Probe> {
     let (inner_call, fn_body) = match sx {
         Sx::Call { callee, args } if args.is_empty() => match callee.as_ref() {
-            Sx::Fn { body, .. } => (find_return_expr(body)?, Some(body)),
+            Sx::Fn { body, .. } => (find_return_string(body)?, Some(body)),
             _ => (sx, None),
         },
         _ => (sx, None),
@@ -1333,41 +1373,124 @@ fn classify_probe(sx: &Sx) -> Option<Probe> {
         return None;
     }
     let inner = &args[0];
+    let body = fn_body.map(|v| v.as_slice());
 
-    if let Some((base, checks)) = resolve_reduce(inner, fn_body.map(|v| v.as_slice())) {
-        return Some(sum_probe(base, &checks, fn_body.map(|v| v.as_slice())));
+    if let Some(p) = metric_probe(inner, body) {
+        return Some(p);
     }
-    let (base, checks) = reduce_chain(inner)?;
-    Some(sum_probe(base, &checks, None))
+    if let Some(p) = jsa_probe(inner, body) {
+        return Some(p);
+    }
+    let (base, checks) = resolve_reduce(inner, body).or_else(|| reduce_chain(inner))?;
+    Some(sum_probe(base, &checks, body))
 }
 
+// Числовой операнд верхнего сложения: String(base + …) → base из Num-узла.
+fn addend_const(sx: &Sx) -> Option<f64> {
+    let Sx::Bin { op: "+", l, r } = sx else { return None };
+    if let Sx::Num(n) = l.as_ref() {
+        return Some(*n);
+    }
+    if let Sx::Num(n) = r.as_ref() {
+        return Some(*n);
+    }
+    addend_const(l).or_else(|| addend_const(r))
+}
+
+// Метрическая проба: String(base + innerHTML.length * querySelectorAll("*").length).
+// Структура читается из AST: base — Num-операнд "+", форма — наличие узлов innerHTML
+// и querySelectorAll, литерал — из Assign{innerHTML = Str} в теле пробы. Значение
+// считает детерминированный WHATWG-парсер (html::metrics), не таблица и не хром.
+fn metric_probe(inner: &Sx, fn_body: Option<&[Sx]>) -> Option<Probe> {
+    if !(has_prop(inner, "innerHTML") && has_call(inner, "querySelectorAll")) {
+        return None;
+    }
+    let base = addend_const(inner)?;
+    let body = fn_body?;
+    let mut lit: Option<String> = None;
+    harvest(body, &mut |s| {
+        if lit.is_none()
+            && let Sx::Assign { target, op: "=", value } = s
+                && let Sx::Member { prop, .. } = target.as_ref()
+                    && prop == "innerHTML"
+                        && let Sx::Str(t) = value.as_ref()
+        {
+            lit = Some(t.clone());
+        }
+    });
+    let html = lit?;
+    let (len, count) = crate::pipeline::html::metrics(&html);
+    Some(Probe {
+        reads: vec![Read::Env {
+            desc: format!("innerHTML({html:?}) → len={len} count={count} [WHATWG-парсер]"),
+        }],
+        base: Some(base),
+        value: Some(base + (len * count) as f64),
+    })
+}
+
+// #jsa self-verification проба: guard'ы `return "NUM"` когда #jsa отсутствует,
+// финальный String([...getAttribute/hasOwnProperty...].reduce(+, NUM)). Челлендж
+// исполняется в main-page где #jsa нет → guard срабатывает → значение = guard-литерал.
+// Структура: querySelector("#jsa") в теле; значение — первый Str-литерал в return.
+fn jsa_probe(_inner: &Sx, fn_body: Option<&[Sx]>) -> Option<Probe> {
+    let body = fn_body?;
+    let mut is_jsa = false;
+    let mut guard: Option<String> = None;
+    harvest(body, &mut |s| {
+        if let Sx::Call { callee, args } = s
+            && let Sx::Member { prop, .. } = callee.as_ref()
+                && prop == "querySelector"
+                    && args.first().and_then(|a| match a {
+                        Sx::Str(t) => Some(t.as_str()),
+                        _ => None,
+                    }) == Some("#jsa")
+        {
+            is_jsa = true;
+        }
+        if guard.is_none()
+            && let Sx::Ret(Some(x)) = s
+                && let Sx::Str(t) = unseq_last(x)
+                    && t.chars().all(|c| c.is_ascii_digit())
+                        && !t.is_empty()
+        {
+            guard = Some(t.clone());
+        }
+    });
+    if !is_jsa {
+        return None;
+    }
+    let g = guard?;
+    let v: f64 = g.parse().ok()?;
+    Some(Probe {
+        reads: vec![Read::Env { desc: format!("#jsa guard → {g} [структурно]") }],
+        base: Some(v),
+        value: Some(v),
+    })
+}
+
+// Значение пробы = base + Σ Number(check). Каждый check решается структурно
+// (check_value по форме AST-узла). Любая нераспознанная форма → value=None,
+// честный отказ вместо угадывания. Никаких таблиц и снапшотов.
 fn sum_probe(base: f64, checks: &[Sx], fn_body: Option<&[Sx]>) -> Probe {
+    let ctx = probe_ctx(fn_body);
     let mut reads: Vec<Read> = Vec::new();
     let mut sum = base;
     let mut unsolvable = false;
-    if let Some(body) = fn_body {
-        let body_desc = render_sx(&Sx::Seq(body.to_vec()));
-        for marker in ["cssText", "appendChild", "textContent", "srcdoc", "#jsa", "sandbox", "Content-Security-Policy", "__DDG_BE_VERSION__"] {
-            if body_desc.contains(marker) {
-                reads.push(Read::Env { desc: format!("body:{marker}") });
-            }
-        }
-    }
     for c in checks {
-        match classify_check(c) {
-            Read::NavUa => {
-                unsolvable = true;
-                reads.push(Read::NavUa);
-            }
-            Read::Env { desc } => {
-                unsolvable = true;
-                reads.push(Read::Env { desc });
-            }
+        if reads_user_agent(c) {
+            unsolvable = true;
+            reads.push(Read::NavUa);
+            continue;
         }
-        match c {
-            Sx::Bool(b) => sum += f64::from(*b),
-            Sx::Num(n) => sum += *n,
-            _ => {}
+        let cv = check_value(c, ctx);
+        match cv {
+            CheckVal::True => sum += 1.0,
+            CheckVal::False => {}
+            CheckVal::Unknown => {
+                unsolvable = true;
+                reads.push(Read::Env { desc: render_sx(c) });
+            }
         }
     }
     Probe { reads, base: Some(base), value: if unsolvable { None } else { Some(sum) } }
@@ -1426,33 +1549,46 @@ fn resolve_reduce(inner: &Sx, fn_body: Option<&[Sx]>) -> Option<(f64, Vec<Sx>)> 
     Some((*base, arr))
 }
 
-
-fn find_return_expr(body: &[Sx]) -> Option<&Sx> {
-    for s in body {
-        match s {
-            Sx::Ret(Some(x)) => {
-                return Some(unseq_last(x));
-            }
-            Sx::Block(inner) | Sx::Seq(inner) => {
-                if let Some(r) = find_return_expr(inner) {
-                    return Some(r);
+// Основной return пробы — тот, что возвращает String(...). Гарды (return "5465")
+// в #jsa-пробе идут раньше; структурно выбираем String-вызов, иначе первый.
+fn find_return_string(body: &[Sx]) -> Option<&Sx> {
+    fn walk<'a>(body: &'a [Sx], string_ret: &mut Option<&'a Sx>, fallback: &mut Option<&'a Sx>) {
+        for s in body {
+            match s {
+                Sx::Ret(Some(x)) => {
+                    let e = unseq_last(x);
+                    let is_string = matches!(e, Sx::Call { callee, args }
+                        if !args.is_empty() && matches!(callee.as_ref(), Sx::Ref(r) if r == "String"));
+                    if is_string && string_ret.is_none() {
+                        *string_ret = Some(e);
+                    } else if fallback.is_none() {
+                        *fallback = Some(e);
+                    }
                 }
-            }
-            Sx::If { c, a, .. } => {
-                if let Some(r) = find_return_expr(c).or_else(|| find_return_expr(a)) {
-                    return Some(r);
+                Sx::Block(inner) | Sx::Seq(inner) => walk(inner, string_ret, fallback),
+                Sx::If { c, a, .. } => {
+                    walk(c, string_ret, fallback);
+                    walk(a, string_ret, fallback);
                 }
-            }
-            Sx::Try { body: tb, .. } => {
-                if let Some(r) = find_return_expr(tb) {
-                    return Some(r);
+                Sx::Try { body: tb, handler, fin } => {
+                    walk(tb, string_ret, fallback);
+                    if let Some((_, hb)) = handler {
+                        walk(hb, string_ret, fallback);
+                    }
+                    walk(fin, string_ret, fallback);
                 }
+                Sx::For { body: fb, .. } | Sx::While { body: fb, .. } => walk(fb, string_ret, fallback),
+                Sx::Fn { body: fb, .. } => walk(fb, string_ret, fallback),
+                _ => {}
             }
-            _ => {}
         }
     }
-    None
+    let mut string_ret: Option<&Sx> = None;
+    let mut fallback: Option<&Sx> = None;
+    walk(body, &mut string_ret, &mut fallback);
+    string_ret.or(fallback)
 }
+
 
 fn unseq_last(x: &Sx) -> &Sx {
     match x {
@@ -1489,13 +1625,6 @@ fn render_sx(sx: &Sx) -> String {
     s
 }
 
-// Честная классификация: чтение описывается структурно, значение не выводится.
-fn classify_check(sx: &Sx) -> Read {
-    if reads_user_agent(sx) {
-        return Read::NavUa;
-    }
-    Read::Env { desc: render_sx(sx) }
-}
 fn reads_user_agent(sx: &Sx) -> bool {
     let mut hit = false;
     walk_sx(sx, &mut |s| {
@@ -1554,14 +1683,25 @@ impl<'a> Deob<'a> {
     }
 
     fn subst(&self, name: &str) -> Sx {
-        if self.mutated.get(name).copied().unwrap_or(0) > 1 {
-            return Sx::Ref(name.to_string());
+        let mut cur: Option<&str> = None;
+        for _ in 0..16 {
+            let key = cur.unwrap_or(name);
+            if self.mutated.get(key).copied().unwrap_or(0) > 1 {
+                return Sx::Ref(key.to_string());
+            }
+            match self.lookup(key) {
+                Some(v @ (Sx::Num(_) | Sx::Str(_) | Sx::Bool(_) | Sx::Null | Sx::Undef)) => return v.clone(),
+                Some(v @ (Sx::Member { .. } | Sx::Index { .. } | Sx::Call { .. } | Sx::New { .. })) => return v.clone(),
+                Some(Sx::Ref(alias)) if alias != key => {
+                    if self.lookup(alias).is_none() {
+                        return Sx::Ref(alias.clone());
+                    }
+                    cur = Some(alias);
+                }
+                _ => return Sx::Ref(key.to_string()),
+            }
         }
-        match self.lookup(name) {
-            Some(v @ (Sx::Num(_) | Sx::Str(_) | Sx::Bool(_) | Sx::Null | Sx::Undef)) => v.clone(),
-            Some(v @ (Sx::Member { .. } | Sx::Index { .. } | Sx::Call { .. } | Sx::New { .. })) => v.clone(),
-            _ => Sx::Ref(name.to_string()),
-        }
+        Sx::Ref(name.to_string())
     }
 
     fn push_scope(&mut self) {
