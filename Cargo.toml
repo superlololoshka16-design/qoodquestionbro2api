@@ -1,0 +1,24 @@
+[package]
+name = "duckkit"
+version = "12.0.0"
+edition = "2024"
+
+[dependencies]
+egg = "0.11.0"
+oxc_allocator = "0.150.0"
+oxc_ast = "0.150.0"
+oxc_parser = "0.150.0"
+oxc_span = "0.150.0"
+thiserror = "2"
+wreq = { version = "0.16", features = ["stream", "gzip", "brotli", "deflate", "cookies", "socks"] }
+wreq-util = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures-util = "0.3"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
