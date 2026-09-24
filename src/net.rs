@@ -81,6 +81,7 @@ impl Http {
                     .build(),
             )
             .redirect(wreq::redirect::Policy::none())
+            .cookie_store(true)
             .timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(12));
         if let Some(p) = &proxy {

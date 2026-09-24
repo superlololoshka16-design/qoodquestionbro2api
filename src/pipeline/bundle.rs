@@ -144,17 +144,23 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 // Факты бандла стабильны на бандл (48ms oxc-парс 2.2MB) — кэш по xxh3(бандл).
 // Совпал хэш → грузим готовый BundleEnv за микросекунды, oxc не запускается.
 pub fn analyze_bundle_cached(src: &str) -> Option<BundleEnv> {
+    let t0 = std::time::Instant::now();
     let key = crate::core::xxh3_64(src.as_bytes());
     let path = cache_dir().map(|d| d.join(format!("bundle-{key:016x}.bin")))?;
     if let Ok(bytes) = std::fs::read(&path)
         && let Some(env) = BundleEnv::from_bytes(&bytes)
     {
+        eprintln!(
+            "[duckkit] бандл {key:016x}: кэш-хит, факты подняты из .bin за {:?} (oxc не запускался)",
+            t0.elapsed()
+        );
         return Some(env);
     }
     let env = analyze_bundle(src)?;
+    let parse = t0.elapsed();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
-        // новый бандл → старый кэш сбрасывается: активен один бандл, прочие stale
+        let mut evicted = 0u32;
         if let Ok(rd) = std::fs::read_dir(parent) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -162,11 +168,19 @@ pub fn analyze_bundle_cached(src: &str) -> Option<BundleEnv> {
                     && p.file_name().map(|f| f.to_string_lossy().starts_with("bundle-")).unwrap_or(false)
                 {
                     let _ = std::fs::remove_file(p);
+                    evicted += 1;
                 }
             }
         }
+        if evicted > 0 {
+            eprintln!("[duckkit] новый хэш бандла — старый кэш сброшен ({evicted} шт)");
+        }
     }
     let _ = std::fs::write(&path, env.to_bytes());
+    eprintln!(
+        "[duckkit] бандл {key:016x}: oxc-парс + извлечение фактов за {parse:?}, сохранено в {}",
+        path.display()
+    );
     Some(env)
 }
 

@@ -12,6 +12,7 @@ fn main() {
         Some("batch") => cmd_batch(&args[1..]),
         Some("facts") => cmd_facts(&args[1..]),
         Some("live") => cmd_live(&args[1..]),
+        Some("chat") => cmd_chat(&args[1..]),
         Some("help") | None => usage(),
         other => {
             eprintln!("неизвестная команда {other:?}");
@@ -27,8 +28,9 @@ fn usage() -> i32 {
          deob <file.js>               полная деобфускация: строки+ротация+константы, читаемый JS\n\
          solve <file.js> [--ua UA]   решить челлендж из файла (пайплайн синхронно)\n\
          batch [dir]                 все фикстуры, таблица значений\n\
-         facts <bundle.js>           факты из живого бандла: стек, timing гонки, dc_*\n\
-         live [--proxy P] \"текст\"    живой E2E: boot→челлендж→compile→chat через сеть"
+         live [--proxy P] \"текст\"    живой E2E: boot→челлендж→compile→chat через сеть\n\
+         chat [--out F] [--proxy P]  живая сессия: сообщения подряд, куки в клиенте,\n\
+                                     история копится, ответы пишутся в JSONL (chat.jsonl)"
     );
     0
 }
@@ -245,4 +247,95 @@ fn run_chat(sess: &mut session::Session, body: &[u8], answer: &mut String) -> se
         }
         wire::Ev::Done => {}
     })
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn log_line(path: &str, role: &str, text: &str) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{{\"ts\":{ts},\"role\":\"{role}\",\"text\":\"{}\"}}", json_escape(text));
+    }
+}
+
+// Живая сессия: куки в wreq-клиенте, история копится, ответы в JSONL,
+// сообщения подряд без boot на каждое. Ответ модели < 1с после решённого jsa.
+fn cmd_chat(rest: &[String]) -> i32 {
+    let out = flag(rest, "--out").unwrap_or_else(|| "chat.jsonl".into());
+    let proxy = flag(rest, "--proxy");
+    let mut sess = match session::Session::boot(proxy) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("chat boot: {e}");
+            return 1;
+        }
+    };
+    let model = flag(rest, "--model").unwrap_or_else(|| sess.default_model.clone());
+    eprintln!("[duckkit] chat: model={model} log={out} — пиши сообщения, пустая строка = выход");
+
+    let mut history: Vec<wire::WireMsg> = Vec::new();
+    let mut window_id = [0u8; 36];
+    let _ = net::uuid_v4(&mut window_id);
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        eprint!("> ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        match stdin.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("stdin: {e}");
+                break;
+            }
+        }
+        let text = line.trim();
+        if text.is_empty() {
+            break;
+        }
+        log_line(&out, "user", text);
+        history.push(wire::WireMsg { role: "user".into(), text: text.into() });
+        let body = wire::duck_body(&wire::BodySpec { model: &model, reasoning: "none", msgs: &history, window_id });
+        let mut answer = String::new();
+        let mut res = run_chat(&mut sess, &body, &mut answer);
+        if matches!(res, session::ChatOutcome::Challenge) {
+            answer.clear();
+            res = run_chat(&mut sess, &body, &mut answer);
+        }
+        eprintln!();
+        match res {
+            session::ChatOutcome::Ok => {
+                let mut clean = String::with_capacity(answer.len());
+                wire::strip_inline_markers(&answer, &mut clean);
+                println!("{clean}");
+                log_line(&out, "assistant", &clean);
+                history.push(wire::WireMsg { role: "assistant".into(), text: clean });
+            }
+            session::ChatOutcome::Challenge => eprintln!("chat: челлендж обновлён — повтори сообщение"),
+            session::ChatOutcome::Err(e) => {
+                log_line(&out, "error", &e);
+                eprintln!("chat: {e}");
+            }
+        }
+    }
+    0
 }
