@@ -27,6 +27,138 @@ pub struct BundleEnv {
     pub signal_events: Vec<Box<str>>,
 }
 
+const CACHE_MAGIC: u32 = 0x44_4B_42_45; // "DKBE"
+const CACHE_VERSION: u8 = 1;
+
+impl BundleEnv {
+    // Ручная бинарная сериализация фактов бандла. Ноль serde, ноль лишних аллокаций.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(128);
+        b.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+        b.push(CACHE_VERSION);
+        match &self.stack {
+            Some(s) => {
+                b.push(1);
+                let n = s.fname.as_bytes();
+                b.extend_from_slice(&(n.len() as u32).to_le_bytes());
+                b.extend_from_slice(n);
+                b.extend_from_slice(&s.line.to_le_bytes());
+                b.extend_from_slice(&s.col_error.to_le_bytes());
+                b.extend_from_slice(&s.col_race.to_le_bytes());
+            }
+            None => b.push(0),
+        }
+        b.extend_from_slice(&self.timing.timeout_ms.to_le_bytes());
+        b.extend_from_slice(&self.timing.duration_delta.to_le_bytes());
+        b.push(u8::from(self.timing.macrotask_zero));
+        b.push(u8::from(self.fe_version_ok));
+        b.extend_from_slice(&(self.signal_events.len() as u32).to_le_bytes());
+        for e in &self.signal_events {
+            let n = e.as_bytes();
+            b.extend_from_slice(&(n.len() as u32).to_le_bytes());
+            b.extend_from_slice(n);
+        }
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<BundleEnv> {
+        let mut r = Reader { b, i: 0 };
+        if r.u32()? != CACHE_MAGIC || r.u8()? != CACHE_VERSION {
+            return None;
+        }
+        let stack = match r.u8()? {
+            1 => Some(StackFacts {
+                fname: r.str()?.into(),
+                line: r.u64()?,
+                col_error: r.u64()?,
+                col_race: r.u64()?,
+            }),
+            0 => None,
+            _ => return None,
+        };
+        let timing = Timing { timeout_ms: r.u64()?, duration_delta: r.i64()?, macrotask_zero: r.u8()? != 0 };
+        let fe_version_ok = r.u8()? != 0;
+        let n = r.u32()? as usize;
+        if n > 4096 {
+            return None;
+        }
+        let mut signal_events = Vec::with_capacity(n);
+        for _ in 0..n {
+            signal_events.push(r.str()?.into());
+        }
+        Some(BundleEnv { stack, timing, fe_version_ok, signal_events })
+    }
+}
+
+struct Reader<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let e = self.i.checked_add(n)?;
+        if e > self.b.len() {
+            return None;
+        }
+        let s = &self.b[self.i..e];
+        self.i = e;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|x| x[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8).map(|x| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(x);
+            u64::from_le_bytes(a)
+        })
+    }
+    fn i64(&mut self) -> Option<i64> {
+        self.u64().map(|v| v as i64)
+    }
+    fn str(&mut self) -> Option<&'a str> {
+        let n = self.u32()? as usize;
+        if n > 1 << 20 {
+            return None;
+        }
+        std::str::from_utf8(self.take(n)?).ok()
+    }
+}
+
+fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("DUCKKIT_CACHE") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("duckkit"))
+}
+
+// Факты бандла стабильны на бандл (48ms oxc-парс 2.2MB) — кэш по xxh3(бандл).
+// Совпал хэш → грузим готовый BundleEnv за микросекунды, oxc не запускается.
+pub fn analyze_bundle_cached(src: &str) -> Option<BundleEnv> {
+    let key = crate::core::xxh3_64(src.as_bytes());
+    let path = cache_dir().map(|d| d.join(format!("bundle-{key:016x}.bin")))?;
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Some(env) = BundleEnv::from_bytes(&bytes)
+    {
+        return Some(env);
+    }
+    let env = analyze_bundle(src)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, env.to_bytes());
+    Some(env)
+}
+
 struct FnFrame {
     span: Span,
     name: Option<Box<str>>,

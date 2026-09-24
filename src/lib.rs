@@ -17,7 +17,7 @@ pub mod pipeline {
     pub mod ops;
     pub mod roles;
 
-    pub use bundle::{analyze_bundle, StackFacts, Timing};
+    pub use bundle::{analyze_bundle, analyze_bundle_cached, StackFacts, Timing};
     pub use flow::{FlowErr, Model, Probe, Read};
 }
 

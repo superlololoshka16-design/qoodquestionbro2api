@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use crate::pipeline::{analyze_bundle, StackFacts, Timing};
+use crate::pipeline::{analyze_bundle_cached, StackFacts, Timing};
 use crate::solver::{self, Facts};
 
 use crate::err::{Err, Net};
@@ -63,7 +63,7 @@ fn find_default_model(models_json: &[u8]) -> Option<String> {
 
 fn bundle_facts(page: &net::Page, bundle_js: &[u8]) -> Result<(StackFacts, Timing, Vec<Box<str>>, String), Err> {
     let bsrc = std::str::from_utf8(bundle_js).map_err(|_| Err::Metric("бандл не UTF-8".into()))?;
-    let benv = analyze_bundle(bsrc).ok_or(Err::Metric("бандл не парсится oxc".into()))?;
+    let benv = analyze_bundle_cached(bsrc).ok_or(Err::Metric("бандл не парсится oxc".into()))?;
     let stack = benv.stack.ok_or(Err::Metric("стек не извлечён из бандла".into()))?;
     if benv.timing.timeout_ms == 0 {
         return Err(Err::Metric("таймаут гонки jsa не найден в бандле".into()));
