@@ -154,6 +154,17 @@ pub fn analyze_bundle_cached(src: &str) -> Option<BundleEnv> {
     let env = analyze_bundle(src)?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        // новый бандл → старый кэш сбрасывается: активен один бандл, прочие stale
+        if let Ok(rd) = std::fs::read_dir(parent) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p != path
+                    && p.file_name().map(|f| f.to_string_lossy().starts_with("bundle-")).unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
     }
     let _ = std::fs::write(&path, env.to_bytes());
     Some(env)

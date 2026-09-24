@@ -162,6 +162,10 @@ fn rules() -> Vec<egg::Rewrite<Math, ConstantFold>> {
         rw!("ushr-0"; "(>>> ?x 0)" => "?x"),
         rw!("mba-or-minus-and"; "(- (| ?a ?b) (& ?a ?b))" => "(^ ?a ?b)"),
         rw!("mba-or-add-and"; "(+ (& ?a ?b) (^ ?a ?b))" => "(| ?a ?b)"),
+        // Коммутативность сложения/умножения — точна в IEEE754, нормализует канон
+        // под стабильный вид: перестановка операндов обфускатором не плывёт.
+        rw!("add-comm"; "(+ ?a ?b)" => "(+ ?b ?a)" if comm_guard("?a", "?b")),
+        rw!("mul-comm"; "(* ?a ?b)" => "(* ?b ?a)" if comm_guard("?a", "?b")),
     ]
 }
 
