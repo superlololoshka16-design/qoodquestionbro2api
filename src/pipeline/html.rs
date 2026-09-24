@@ -1,9 +1,10 @@
-// WHATWG HTML fragment parsing — детерминированная чистая функция, один проход.
-// Не браузер, не DOM, ноль памяти под узлы: только стек открытых имён + два
-// счётчика. Длина сериализации innerHTML от глубины не зависит (каждый элемент
-// даёт `<name>` при открытии и `</name>` при закрытии), поэтому дерево не нужно.
-// Возвращает (innerHTML.length, querySelectorAll("*").length). Вход — строковый
-// литерал из AST; любая новая строка считается на месте, таблица не нужна.
+// WHATWG HTML fragment metrics — zero-alloc, один проход по байтам.
+// Не браузер, не DOM, ноль аллокаций: стек имён = &[str]-срезы самого входа,
+// два счётчика. Длина сериализации innerHTML от глубины не зависит (элемент
+// даёт `<name>` при открытии, `</name>` при закрытии), дерево не нужно.
+// Возвращает (innerHTML.length, querySelectorAll("*").length). Вход — литерал
+// из AST; вызывается ОДИН раз в AST-проходе, результат сворачивается в
+// Op::Const и компилируется cranelift'ом — в рантайме это готовый `mov`.
 
 const VOID: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
@@ -15,67 +16,89 @@ const FMT: &[&str] = &[
 ];
 const IMPLIES_P: &[&str] = &[
     "address", "article", "aside", "blockquote", "details", "div", "dd", "dl", "dt", "fieldset",
-    "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup",
-    "hr", "li", "main", "menu", "nav", "ol", "p", "section", "table", "ul",
+    "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+    "hgroup", "hr", "li", "main", "menu", "nav", "ol", "p", "section", "table", "ul",
 ];
 const SCOPE_STOP: &[&str] = &[
     "applet", "caption", "html", "td", "th", "marquee", "object", "template", "button",
 ];
+const LI_SPECIAL: &[&str] = &["address", "div", "p"];
 
-fn is_void(n: &str) -> bool {
-    VOID.contains(&n)
+#[inline]
+fn any(list: &[&str], n: &str) -> bool {
+    list.iter().any(|v| v.eq_ignore_ascii_case(n))
+}
+
+#[inline]
+fn alpha_prefix(s: &str) -> &str {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_alphabetic())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+struct P<'a> {
+    len: usize,
+    cnt: usize,
+    stack: [&'a str; 64],
+    depth: usize,
+}
+
+impl<'a> P<'a> {
+    #[inline]
+    fn open(&mut self, nm: &'a str) {
+        self.len += nm.len() + 2;
+        self.cnt += 1;
+        if !any(VOID, nm) && self.depth < 64 {
+            self.stack[self.depth] = nm;
+            self.depth += 1;
+        }
+    }
+    #[inline]
+    fn close(&mut self, nm: &str) {
+        self.len += nm.len() + 3;
+    }
+    fn in_scope(&self, nm: &str) -> bool {
+        for i in (0..self.depth).rev() {
+            if self.stack[i].eq_ignore_ascii_case(nm) {
+                return true;
+            }
+            if any(SCOPE_STOP, self.stack[i]) {
+                return false;
+            }
+        }
+        false
+    }
+    fn pop_until(&mut self, nm: &str) {
+        while self.depth > 0 {
+            self.depth -= 1;
+            let top = self.stack[self.depth];
+            let hit = top.eq_ignore_ascii_case(nm);
+            self.close(top);
+            if hit {
+                break;
+            }
+        }
+    }
+    fn close_p(&mut self) {
+        while self.depth > 0 {
+            self.depth -= 1;
+            let top = self.stack[self.depth];
+            let is_p = top.eq_ignore_ascii_case("p");
+            self.close(top);
+            if is_p {
+                break;
+            }
+        }
+    }
 }
 
 pub fn metrics(frag: &str) -> (usize, usize) {
     let b = frag.as_bytes();
     let n = b.len();
-    let mut len = 0usize; // длина сериализации innerHTML
-    let mut cnt = 0usize; // число элементов = querySelectorAll("*").length
-    let mut stack: Vec<String> = Vec::new(); // открытые элементы (глубина вложенности)
-
-    // открыть элемент: emit `<name>`, счётчик++; не-void кладём в стек
-    let open = |nm: &str, len: &mut usize, cnt: &mut usize, stack: &mut Vec<String>| {
-        *len += nm.len() + 2;
-        *cnt += 1;
-        if !is_void(nm) {
-            stack.push(nm.to_string());
-        }
-    };
-    // закрыть один элемент: emit `</name>`
-    let close = |nm: &str, len: &mut usize| {
-        *len += nm.len() + 3;
-    };
-    let in_scope = |nm: &str, stack: &[String]| -> bool {
-        for s in stack.iter().rev() {
-            if s == nm {
-                return true;
-            }
-            if SCOPE_STOP.contains(&s.as_str()) {
-                return false;
-            }
-        }
-        false
-    };
-    // pop до элемента nm включительно, emit их `</name>`
-    let pop_until = |nm: &str, len: &mut usize, stack: &mut Vec<String>| {
-        while let Some(top) = stack.pop() {
-            let hit = top == nm;
-            close(&top, len);
-            if hit {
-                break;
-            }
-        }
-    };
-    let close_p = |len: &mut usize, stack: &mut Vec<String>| {
-        while let Some(top) = stack.pop() {
-            let is_p = top == "p";
-            close(&top, len);
-            if is_p {
-                break;
-            }
-        }
-    };
-
+    let mut p = P { len: 0, cnt: 0, stack: [""; 64], depth: 0 };
     let mut i = 0usize;
     while i < n {
         if b[i] == b'<' {
@@ -84,63 +107,64 @@ pub fn metrics(frag: &str) -> (usize, usize) {
                 j += 1;
             }
             if j >= n {
-                break; // тег обрывается на EOF — дропается (parse error)
+                break; // тег оборван на EOF — дропается (parse error)
             }
             let tag = &frag[i + 1..j];
             i = j + 1;
-            if tag.starts_with('/') {
-                let nm: String = tag[1..].chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
+            if let Some(rest) = tag.strip_prefix('/') {
+                let nm = alpha_prefix(rest);
                 if nm.is_empty() {
                     continue;
                 }
-                if nm == "br" {
-                    open("br", &mut len, &mut cnt, &mut stack); // </br> = parse error, вставляет <br>
-                } else if nm == "p" {
-                    if in_scope("p", &stack) {
-                        close_p(&mut len, &mut stack);
+                if nm.eq_ignore_ascii_case("br") {
+                    p.open(nm); // </br> = parse error, но вставляет <br>
+                } else if nm.eq_ignore_ascii_case("p") {
+                    if p.in_scope("p") {
+                        p.close_p();
                     } else {
-                        open("p", &mut len, &mut cnt, &mut stack);
-                        pop_until("p", &mut len, &mut stack);
+                        p.open(nm);
+                        p.pop_until("p");
                     }
-                } else if in_scope(&nm, &stack) {
-                    pop_until(&nm, &mut len, &mut stack);
+                } else if p.in_scope(nm) {
+                    p.pop_until(nm);
                 }
             } else if tag.starts_with('!') || tag.starts_with('?') || tag.is_empty() {
                 // doctype / комментарий / PI — во фрагменте игнорируются
             } else {
-                let nm: String = tag.chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
+                let nm = alpha_prefix(tag);
                 if nm.is_empty() {
                     continue;
                 }
-                if !FMT.contains(&nm.as_str()) && !is_void(&nm) && IMPLIES_P.contains(&nm.as_str()) && in_scope("p", &stack) {
-                    close_p(&mut len, &mut stack);
+                if !any(FMT, nm) && !any(VOID, nm) && any(IMPLIES_P, nm) && p.in_scope("p") {
+                    p.close_p();
                 }
-                if nm == "li" {
-                    let mut k = stack.len();
+                if nm.eq_ignore_ascii_case("li") {
+                    let mut k = p.depth;
                     while k > 0 {
                         k -= 1;
-                        if stack[k] == "li" {
-                            pop_until("li", &mut len, &mut stack);
+                        if p.stack[k].eq_ignore_ascii_case("li") {
+                            p.pop_until("li");
                             break;
                         }
-                        if !matches!(stack[k].as_str(), "address" | "div" | "p") {
+                        if !any(LI_SPECIAL, p.stack[k]) {
                             break;
                         }
                     }
                 }
-                open(&nm, &mut len, &mut cnt, &mut stack);
+                p.open(nm);
             }
         } else {
             let start = i;
             while i < n && b[i] != b'<' {
                 i += 1;
             }
-            len += i - start; // текстовый узел: сырая длина (в литералах челленджа текста нет)
+            p.len += i - start; // текстовый узел: сырая длина
         }
     }
-    // EOF: все открытые элементы закрываются
-    while let Some(top) = stack.pop() {
-        close(&top, &mut len);
+    while p.depth > 0 {
+        p.depth -= 1;
+        let top = p.stack[p.depth];
+        p.close(top);
     }
-    (len, cnt)
+    (p.len, p.cnt)
 }
