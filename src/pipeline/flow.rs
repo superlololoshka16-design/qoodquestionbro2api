@@ -969,9 +969,9 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
     tr.expr(checksum_expr).map_err(|e| FlowErr::Read(format!("перевод checksum: {e}")))?;
     let t = tr.finish();
     let simp = mba::simplify(&t.recexpr);
-    // egg-канон → cranelift-код ОДИН раз на full_hash, дальше кэш. rotation-цикл
-    // ниже гоняет eval до n раз — нативный call вместо интерпретации.
-    let jit = crate::pipeline::jit::compile_cached(simp.report.full_hash, &simp.program).ok();
+    // egg-канон → cranelift-код ОДИН раз на content_hash (структура опкодов без
+    // имён варов), дальше кэш. rotation-цикл гоняет eval до n раз — нативный call.
+    let jit = crate::pipeline::jit::compile_cached(simp.program.content_hash(), &simp.program).ok();
 
     let vals: Vec<f64> = orig.iter().map(|s| crate::core::jsnum::js_parse_int(s)).collect();
     let delta_i = delta as i64;

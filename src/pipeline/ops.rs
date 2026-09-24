@@ -23,6 +23,33 @@ pub struct Program {
 }
 
 impl Program {
+    // Хэш СОДЕРЖИМОГО программы: последовательность опкодов (Const-значения +
+    // позиционные Var-слоты + арифметика). Имена варов не участвуют — Var(slot)
+    // это индекс, не имя. Две программы с идентичной структурой дают один хэш →
+    // один скомпилированный cranelift-код. Это правильный ключ кэша (не full_hash,
+    // который включает имена варов и потому никогда не бьёт между челленджами).
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.n_vars.hash(&mut h);
+        for op in &self.ops {
+            match op {
+                Op::Const(c) => {
+                    0u8.hash(&mut h);
+                    c.to_bits().hash(&mut h);
+                }
+                Op::Var(i) => {
+                    1u8.hash(&mut h);
+                    i.hash(&mut h);
+                }
+                other => {
+                    std::mem::discriminant(other).hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+
     pub fn eval(&self, vars: &[f64]) -> f64 {
         let mut stack = [0f64; 64];
         let mut sp: usize = 0;
