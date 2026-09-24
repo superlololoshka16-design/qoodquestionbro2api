@@ -12,6 +12,7 @@ pub mod pipeline {
     pub mod deob;
     pub mod flow;
     pub mod html;
+    pub mod jit;
     pub mod mba;
     pub mod ops;
     pub mod roles;

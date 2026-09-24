@@ -969,12 +969,18 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
     tr.expr(checksum_expr).map_err(|e| FlowErr::Read(format!("перевод checksum: {e}")))?;
     let t = tr.finish();
     let simp = mba::simplify(&t.recexpr);
+    // egg-канон → cranelift: компиляция ОДИН раз на full_hash канона, дальше
+    // thread_local кэш. rotation-цикл гоняет нативный fn вместо интерпретатора.
+    // Канарейка: первый прогон сверяет jit с интерпретатором бит-в-бит на
+    // реальных данных; расхождение → jit отключается, fallback Program::eval.
+    let jit = crate::pipeline::jit::compile_cached(simp.report.full_hash, &simp.program).ok();
 
     let vals: Vec<f64> = orig.iter().map(|s| crate::core::jsnum::js_parse_int(s)).collect();
     let delta_i = delta as i64;
     let mut buf = vec![0f64; t.var_args.len().max(1)];
     let mut rot_k: Option<usize> = None;
     let mut best: Option<(usize, f64)> = None;
+    let mut jit_ok: Option<bool> = None;
     for k in 0..n {
         for (vi, &a) in t.var_args.iter().enumerate() {
             let idx = if left {
@@ -984,7 +990,15 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
             };
             buf[vi] = vals[idx];
         }
-        let v = simp.program.eval(&buf);
+        let v = match (&jit, jit_ok) {
+            (Some(j), None) => {
+                let iv = simp.program.eval(&buf);
+                jit_ok = Some(j.call(&buf).to_bits() == iv.to_bits());
+                iv
+            }
+            (Some(j), Some(true)) => j.call(&buf),
+            _ => simp.program.eval(&buf),
+        };
         if v == target {
             rot_k = Some(k);
             break;
