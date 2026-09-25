@@ -26,6 +26,8 @@ pub enum FlowErr {
     Payload(String),
     #[error("вне модели: {0}")]
     Read(String),
+    #[error("cranelift: {0}")]
+    Jit(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1013,17 +1015,17 @@ pub fn run(
     let t = tr.finish();
     let simp = mba::simplify(&t.recexpr);
     // egg-канон → cranelift: компиляция ОДИН раз на full_hash канона, дальше
-    // thread_local кэш. rotation-цикл гоняет нативный fn вместо интерпретатора.
-    // Канарейка: первый прогон сверяет jit с интерпретатором бит-в-бит на
-    // реальных данных; расхождение → jit отключается, fallback Program::eval.
-    let jit = crate::pipeline::jit::compile_cached(simp.report.full_hash, &simp.program).ok();
+    // thread_local кэш; rotation-цикл гоняет нативный fn. Никаких фалбеков:
+    // compile-ошибка = FlowErr::Jit, канарейка-расхождение = FlowErr::Jit.
+    let jit = crate::pipeline::jit::compile_cached(simp.report.full_hash, &simp.program)
+        .map_err(|e| FlowErr::Jit(e.to_string()))?;
 
     let vals: Vec<f64> = orig.iter().map(|s| crate::core::jsnum::js_parse_int(s)).collect();
     let delta_i = delta as i64;
     let mut buf = vec![0f64; t.var_args.len().max(1)];
     let mut rot_k: Option<usize> = None;
     let mut best: Option<(usize, f64)> = None;
-    let mut jit_ok: Option<bool> = None;
+    let mut canary_done = false;
     for k in 0..n {
         for (vi, &a) in t.var_args.iter().enumerate() {
             let idx = if left {
@@ -1033,15 +1035,16 @@ pub fn run(
             };
             buf[vi] = vals[idx];
         }
-        let v = match (&jit, jit_ok) {
-            (Some(j), None) => {
-                let iv = simp.program.eval(&buf);
-                jit_ok = Some(j.call(&buf).to_bits() == iv.to_bits());
-                iv
+        let v = jit.call(&buf);
+        if !canary_done {
+            // канарейка = верификация, не фалбек: расхождение бит-в-бит с
+            // эталонной семантикой (интерпретатор) → громкая ошибка.
+            let iv = simp.program.eval(&buf);
+            if v.to_bits() != iv.to_bits() {
+                return Err(FlowErr::Jit(format!("канарейка: {v} != {iv}")));
             }
-            (Some(j), Some(true)) => j.call(&buf),
-            _ => simp.program.eval(&buf),
-        };
+            canary_done = true;
+        }
         if v == target {
             rot_k = Some(k);
             break;

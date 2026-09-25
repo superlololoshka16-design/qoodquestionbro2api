@@ -160,33 +160,19 @@ impl Session {
     }
 
     pub fn refresh_jsa(&mut self) -> Result<(), Err> {
-        const MAX: u32 = 5;
-        for attempt in 1..=MAX {
-            let b64: Vec<u8> = match self.pending.take() {
-                Some(p) => p,
-                None => self.fetch_challenge()?,
-            };
-            let Some(js) = crate::core::b64::decode(&b64) else {
-                return Err(Err::Metric("челлендж не декодируется из base64".into()));
-            };
-            let src = std::str::from_utf8(&js).map_err(|_| Err::Metric("челлендж не UTF-8".into()))?;
-            let timeout = self.facts.timing.timeout_ms;
-            let dur = 8u64 + solver::sample_u64(&mut self.rng, timeout / 2);
-            match solver::token(src, &self.ua, &self.facts, dur) {
-                Ok(t) => {
-                    self.jsa = Some(t);
-                    return Ok(());
-                }
-                Err(e) if attempt < MAX => {
-                    if std::env::var("DK_DUMP").is_ok() {
-                        let _ = std::fs::write("missed_challenge.js", &js);
-                    }
-                    eprintln!("[duckkit] вариант челленджа вне модели ({e}) — запрос новый ({attempt}/{MAX})");
-                }
-                Err(e) => return Err(Err::Session(e.to_string())),
-            }
-        }
-        Err(Err::Session("jsa не решён за 5 попыток".into()))
+        let b64: Vec<u8> = match self.pending.take() {
+            Some(p) => p,
+            None => self.fetch_challenge()?,
+        };
+        let Some(js) = crate::core::b64::decode(&b64) else {
+            return Err(Err::Metric("челлендж не декодируется из base64".into()));
+        };
+        let src = std::str::from_utf8(&js).map_err(|_| Err::Metric("челлендж не UTF-8".into()))?;
+        let timeout = self.facts.timing.timeout_ms;
+        let dur = 8u64 + solver::sample_u64(&mut self.rng, timeout / 2);
+        let t = solver::token(src, &self.ua, &self.facts, dur).map_err(|e| Err::Session(e.to_string()))?;
+        self.jsa = Some(t);
+        Ok(())
     }
 
     pub fn reboot_facts(&mut self) -> Result<(), Err> {
@@ -250,36 +236,36 @@ impl Session {
         if let Some(nc) = next_challenge {
             new_challenge = Some(nc.as_bytes().to_vec());
         }
-        eprintln!("[duckkit] chat status={status}");
+        // 410 = факты бандла устарели: пересобрать и решить новый челлендж.
         if status == 410 {
-            if self.reboot_facts().is_err() {
-                return ChatOutcome::Err("410: пересборка фактов не удалась".into());
+            if let Err(e) = self.reboot_facts() {
+                return ChatOutcome::Err(format!("410 reboot: {e}"));
             }
             self.pending = new_challenge;
-            if self.refresh_jsa().is_err() {
-                return ChatOutcome::Err("410: jsa refresh после пересборки фактов не удался".into());
+            if let Err(e) = self.refresh_jsa() {
+                return ChatOutcome::Err(format!("410 jsa: {e}"));
             }
             return ChatOutcome::Challenge;
         }
-        if status == 418 || status == 429 {
+        // 418 = токен истёк, сервер выдал новый челлендж — решаем его. Это протокол.
+        if status == 418 {
             self.pending = new_challenge;
             if let Err(e) = self.refresh_jsa() {
-                eprintln!("[duckkit] refresh после {status} не удался ({e}) — пересборка фактов");
-                let _ = self.reboot_facts();
-                self.pending = None;
-                if self.refresh_jsa().is_err() {
-                    return ChatOutcome::Err("jsa refresh после 418/429 не удался".into());
-                }
+                return ChatOutcome::Err(format!("418 jsa: {e}"));
             }
             return ChatOutcome::Challenge;
+        }
+        if status == 429 {
+            return ChatOutcome::Err("429: rate limit — следи за частотой запросов".into());
         }
         if status != 200 {
             return ChatOutcome::Err(format!("duck статус {status}"));
         }
+        // 200: сервер выдал челлендж на следующий запрос — решаем сразу, не «потом».
         if let Some(nc) = new_challenge {
             self.pending = Some(nc);
-            if self.refresh_jsa().is_err() {
-                eprintln!("[duckkit] следующий конверт не решён — решится на следующем запросе");
+            if let Err(e) = self.refresh_jsa() {
+                return ChatOutcome::Err(format!("next jsa: {e}"));
             }
         }
         ChatOutcome::Ok

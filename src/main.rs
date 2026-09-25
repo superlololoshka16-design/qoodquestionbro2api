@@ -215,7 +215,7 @@ fn cmd_live(rest: &[String]) -> i32 {
     let msgs = vec![wire::WireMsg { role: "user".into(), text: prompt }];
     let body = wire::duck_body(&wire::BodySpec { model: &model, reasoning: "none", msgs: &msgs, window_id });
 
-    eprintln!("[duckkit] model={model} jsa-full={}", sess.jsa_token().map(|s| &s[..]).unwrap_or("?"));
+    eprintln!("[duckkit] model={model}");
     let mut answer = String::new();
     let mut res = run_chat(&mut sess, &body, &mut answer);
     if matches!(res, session::ChatOutcome::Challenge) {
