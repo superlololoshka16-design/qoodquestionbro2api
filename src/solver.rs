@@ -6,6 +6,10 @@ pub struct Facts {
     pub timing: Timing,
     pub origin: &'static str,
     pub bundle_url: String,
+    // Факты верификации из AST бандла: jsa-чеки сверяют литералы челленджа
+    // с ними (точное сравнение, ноль угадывания).
+    pub verify_attrs: Vec<(Box<str>, Box<str>)>,
+    pub verify_globals: Vec<Box<str>>,
 }
 
 impl Facts {
@@ -15,6 +19,8 @@ impl Facts {
             timing: Timing { timeout_ms: 500, duration_delta: 0, macrotask_zero: true },
             origin: "https://duck.ai",
             bundle_url: "https://duck.ai/dist/duckai-dist/entry.duckai.c51e9bb9ebdb169571b0.js".into(),
+            verify_attrs: Vec::new(),
+            verify_globals: Vec::new(),
         }
     }
 }
@@ -49,7 +55,7 @@ fn xor_debug(sigs: &[(&str, &str)], key: &str, out: &mut String) {
 }
 
 pub fn token(js: &str, ua: &str, facts: &Facts, duration: u64) -> Result<String, flow::FlowErr> {
-    let m = flow::run(js)?;
+    let m = flow::run(js, &facts.verify_attrs, &facts.verify_globals)?;
     let mut p = String::with_capacity(768);
     p.push_str("{\"server_hashes\":[");
     for (i, h) in m.server_hashes.iter().enumerate() {

@@ -25,10 +25,17 @@ pub struct BundleEnv {
     pub timing: Timing,
     pub fe_version_ok: bool,
     pub signal_events: Vec<Box<str>>,
+    // Факты верификации из АСТ бандла: (атрибут, значение) которые бандл сам
+    // ставит на #jsa (sandbox, content=CSP из srcDoc) и имена глобалов (__DDG_*).
+    // Челлендж сверяет СВОИ литералы с ними; значение чека = точное сравнение
+    // двух AST-фактов, ноль угадывания. Смена значений в бандле меняет факты —
+    // сравнение адаптируется само.
+    pub verify_attrs: Vec<(Box<str>, Box<str>)>,
+    pub verify_globals: Vec<Box<str>>,
 }
 
 const CACHE_MAGIC: u32 = 0x44_4B_42_45; // "DKBE"
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
 
 impl BundleEnv {
     // Ручная бинарная сериализация фактов бандла. Ноль serde, ноль лишних аллокаций.
@@ -54,6 +61,21 @@ impl BundleEnv {
         b.push(u8::from(self.fe_version_ok));
         b.extend_from_slice(&(self.signal_events.len() as u32).to_le_bytes());
         for e in &self.signal_events {
+            let n = e.as_bytes();
+            b.extend_from_slice(&(n.len() as u32).to_le_bytes());
+            b.extend_from_slice(n);
+        }
+        b.extend_from_slice(&(self.verify_attrs.len() as u32).to_le_bytes());
+        for (attr, val) in &self.verify_attrs {
+            let a = attr.as_bytes();
+            b.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            b.extend_from_slice(a);
+            let v = val.as_bytes();
+            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            b.extend_from_slice(v);
+        }
+        b.extend_from_slice(&(self.verify_globals.len() as u32).to_le_bytes());
+        for e in &self.verify_globals {
             let n = e.as_bytes();
             b.extend_from_slice(&(n.len() as u32).to_le_bytes());
             b.extend_from_slice(n);
@@ -86,7 +108,25 @@ impl BundleEnv {
         for _ in 0..n {
             signal_events.push(r.str()?.into());
         }
-        Some(BundleEnv { stack, timing, fe_version_ok, signal_events })
+        let nv = r.u32().unwrap_or(0) as usize;
+        if nv > 4096 {
+            return None;
+        }
+        let mut verify_attrs = Vec::with_capacity(nv);
+        for _ in 0..nv {
+            let attr: Box<str> = r.str()?.into();
+            let val: Box<str> = r.str()?.into();
+            verify_attrs.push((attr, val));
+        }
+        let ng = r.u32().unwrap_or(0) as usize;
+        if ng > 4096 {
+            return None;
+        }
+        let mut verify_globals = Vec::with_capacity(ng);
+        for _ in 0..ng {
+            verify_globals.push(r.str()?.into());
+        }
+        Some(BundleEnv { stack, timing, fe_version_ok, signal_events, verify_attrs, verify_globals })
     }
 }
 
@@ -202,6 +242,8 @@ struct Walk {
     macrotask_zero: bool,
     macrotask_zeros: Vec<u32>,
     aliases: std::collections::HashMap<String, &'static str>,
+    verify_attrs: Vec<(Box<str>, Box<str>)>,
+    verify_globals: Vec<Box<str>>,
 }
 
 fn common_prefix(names: &[Box<str>]) -> Option<String> {
@@ -303,6 +345,29 @@ impl Walk {
                         "duration" => {
                             self.duration_delta = self.duration_delta.or(duration_delta_of(&p.value));
                         }
+                        // #jsa sandbox-атрибут: (атрибут, значение) которое бандл сам ставит
+                        "sandbox" => {
+                            if let Expression::StringLiteral(s) = &p.value
+                                && !self.verify_attrs.iter().any(|(a, _)| a.as_ref() == "sandbox")
+                            {
+                                self.verify_attrs.push(("sandbox".into(), s.value.as_str().into()));
+                            }
+                        }
+                        // srcDoc-шаблон #jsa: CSP живёт внутри content="..." мета-тега
+                        "srcDoc" => {
+                            if let Expression::StringLiteral(s) = &p.value {
+                                let mut rest = s.value.as_str();
+                                while let Some(q) = rest.find("content=\"") {
+                                    let v = &rest[q + 9..];
+                                    let Some(end) = v.find('"') else { break };
+                                    let lit = &v[..end];
+                                    if !self.verify_attrs.iter().any(|(_, x)| x.as_ref() == lit) {
+                                        self.verify_attrs.push(("content".into(), lit.into()));
+                                    }
+                                    rest = &v[end..];
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -346,8 +411,18 @@ impl Walk {
             Expression::StaticMemberExpression(m) => {
                 let prop = m.property.name.as_str();
                 match prop {
-                    "__DDG_BE_VERSION__" => self.fever_ids |= 1,
-                    "__DDG_FE_CHAT_HASH__" => self.fever_ids |= 2,
+                    "__DDG_BE_VERSION__" => {
+                        self.fever_ids |= 1;
+                        if !self.verify_globals.iter().any(|g| g.as_ref() == prop) {
+                            self.verify_globals.push(prop.into());
+                        }
+                    }
+                    "__DDG_FE_CHAT_HASH__" => {
+                        self.fever_ids |= 2;
+                        if !self.verify_globals.iter().any(|g| g.as_ref() == prop) {
+                            self.verify_globals.push(prop.into());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -687,6 +762,8 @@ pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
         macrotask_zero: false,
         macrotask_zeros: Vec::new(),
         aliases: std::collections::HashMap::new(),
+        verify_attrs: Vec::new(),
+        verify_globals: Vec::new(),
     };
     for s in &ret.program.body {
         walk_stmt(s, &mut w);
@@ -700,6 +777,8 @@ pub fn analyze_bundle(src: &str) -> Option<BundleEnv> {
         },
         fe_version_ok: w.fever_ids == 3 && w.fever_attrs == 3,
         signal_events: w.signals.clone().unwrap_or_default(),
+        verify_attrs: w.verify_attrs.clone(),
+        verify_globals: w.verify_globals.clone(),
     };
     if let Some((sepos, rapos, sanc)) = find_stack(&w) {
         let (line, col_error) = utf16_line_col(src, sepos as usize);

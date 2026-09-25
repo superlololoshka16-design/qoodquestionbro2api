@@ -83,9 +83,15 @@ pub enum CheckVal {
     Unknown,
 }
 
+// Факты верификации из AST бандла (oxc): пары (атрибут, значение) которые бандл
+// сам ставит на #jsa (sandbox, content=CSP из srcDoc) и имена глобалов (__DDG_*).
+// Значение jsa-чека = ТОЧНОЕ сравнение литерала челленджа с фактом бандла.
+// Ноль угадывания: смена значений в бандле меняет факты — сравнение адаптируется.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ProbeCtx {
+pub struct ProbeCtx<'a> {
     pub attached_styled: bool,
+    pub verify_attrs: &'a [(Box<str>, Box<str>)],
+    pub verify_globals: &'a [Box<str>],
 }
 
 fn has_prop(sx: &Sx, prop: &str) -> bool {
@@ -148,7 +154,7 @@ fn is_self_plus_k(sx: &Sx) -> bool {
 
 // Значение чека выводится из ФОРМЫ AST-узла (web-платформа детерминирована).
 // Неизвестная форма → Unknown → честный отказ, никакого угадывания.
-pub fn check_value(c: &Sx, ctx: ProbeCtx) -> CheckVal {
+pub fn check_value(c: &Sx, ctx: ProbeCtx<'_>) -> CheckVal {
     use CheckVal::*;
     if let Some(b) = truthy(c) {
         return if b { True } else { False };
@@ -195,6 +201,39 @@ pub fn check_value(c: &Sx, ctx: ProbeCtx) -> CheckVal {
     }
     if let Sx::Bin { op: "instanceof", .. } = c {
         return True;
+    }
+    // #jsa self-verification: getAttribute("<attr>") === "<literal>".
+    // Значение = ТОЧНОЕ сравнение литерала челленджа с фактом бандла
+    // (verify_attrs: бандл сам ставит sandbox/CSP на #jsa). Совпало → True,
+    // разошлось → False. Ноль угадывания: смена значений в бандле меняет
+    // факты — сравнение адаптируется само.
+    if let Sx::Bin { op: "===", l, r } = c {
+        for (a, b) in [(l.as_ref(), r.as_ref()), (r.as_ref(), l.as_ref())] {
+            if let Sx::Call { callee, args } = a
+                && let Sx::Member { prop, .. } = callee.as_ref()
+                    && prop == "getAttribute"
+                        && let Some(Sx::Str(attr)) = args.first()
+                            && let Sx::Str(expected) = b
+            {
+                // attr = имя атрибута ("sandbox"/"content"), expected = значение
+                // с которым челлендж себя сверяет. True только если бандл реально
+                // ставит ЭТОТ атрибут в ЭТО значение — точное совпадение пары фактов.
+                return if ctx.verify_attrs.iter().any(|(a, v)| a.as_ref() == attr.as_str() && v.as_ref() == expected.as_str())
+                {
+                    True
+                } else {
+                    False
+                };
+            }
+        }
+    }
+    // window.top.hasOwnProperty("<global>") — имя сверяется с фактами бандла.
+    if let Sx::Call { callee, args } = c
+        && let Sx::Member { prop, .. } = callee.as_ref()
+            && prop == "hasOwnProperty"
+                && let Some(Sx::Str(g)) = args.first()
+    {
+        return if ctx.verify_globals.iter().any(|x| x.as_ref() == g.as_str()) { True } else { False };
     }
     if let Sx::Bin { op: "===", l, r } = c {
         let is_win = |s: &Sx| matches!(s, Sx::Ref(w) if w == "window");
@@ -921,7 +960,11 @@ fn checksum_expr_walk(e: &Expression, f: &mut impl FnMut(&Expression)) {
     go(e, f);
 }
 
-pub fn run(src: &str) -> Result<Model, FlowErr> {
+pub fn run(
+    src: &str,
+    verify_attrs: &[(Box<str>, Box<str>)],
+    verify_globals: &[Box<str>],
+) -> Result<Model, FlowErr> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::default()).parse();
     if ret.fatal_error {
@@ -1149,7 +1192,7 @@ pub fn run(src: &str) -> Result<Model, FlowErr> {
         return Err(FlowErr::Payload("challenge_id/timestamp пусты".into()));
     }
 
-    let (ua_first, probes) = extract_probes(&body)?;
+    let (ua_first, probes) = extract_probes(&body, verify_attrs, verify_globals)?;
 
     Ok(Model {
         rotation: k,
@@ -1291,7 +1334,11 @@ fn is_charcodeat(sx: &Sx) -> bool {
 }
 
 
-fn extract_probes(body: &[Sx]) -> Result<(bool, Vec<Probe>), FlowErr> {
+fn extract_probes<'a>(
+    body: &[Sx],
+    attrs: &'a [(Box<str>, Box<str>)],
+    globals: &'a [Box<str>],
+) -> Result<(bool, Vec<Probe>), FlowErr> {
     let mut ua_first = false;
     let mut probes: Vec<Probe> = Vec::new();
     let mut found = false;
@@ -1321,7 +1368,7 @@ fn extract_probes(body: &[Sx]) -> Result<(bool, Vec<Probe>), FlowErr> {
                 }
                 continue;
             }
-            if let Some(p) = classify_probe(it) {
+            if let Some(p) = classify_probe(it, attrs, globals) {
                 probes.push(p);
             } else {
                 probes.push(Probe { reads: vec![Read::Env { desc: render_sx(it) }], base: None, value: None });
@@ -1334,8 +1381,12 @@ fn extract_probes(body: &[Sx]) -> Result<(bool, Vec<Probe>), FlowErr> {
     Ok((ua_first, probes))
 }
 
-fn probe_ctx(fn_body: Option<&[Sx]>) -> ProbeCtx {
-    let mut ctx = ProbeCtx::default();
+fn probe_ctx<'a>(
+    fn_body: Option<&[Sx]>,
+    attrs: &'a [(Box<str>, Box<str>)],
+    globals: &'a [Box<str>],
+) -> ProbeCtx<'a> {
+    let mut ctx = ProbeCtx { attached_styled: false, verify_attrs: attrs, verify_globals: globals };
     if let Some(body) = fn_body {
         let seq = Sx::Seq(body.to_vec());
         let mut styled = false;
@@ -1359,7 +1410,11 @@ fn probe_ctx(fn_body: Option<&[Sx]>) -> ProbeCtx {
     ctx
 }
 
-fn classify_probe(sx: &Sx) -> Option<Probe> {
+fn classify_probe<'a>(
+    sx: &Sx,
+    attrs: &'a [(Box<str>, Box<str>)],
+    globals: &'a [Box<str>],
+) -> Option<Probe> {
     let (inner_call, fn_body) = match sx {
         Sx::Call { callee, args } if args.is_empty() => match callee.as_ref() {
             Sx::Fn { body, .. } => (find_return_string(body)?, Some(body)),
@@ -1378,11 +1433,8 @@ fn classify_probe(sx: &Sx) -> Option<Probe> {
     if let Some(p) = metric_probe(inner, body) {
         return Some(p);
     }
-    if let Some(p) = jsa_probe(inner, body) {
-        return Some(p);
-    }
     let (base, checks) = resolve_reduce(inner, body).or_else(|| reduce_chain(inner))?;
-    Some(sum_probe(base, &checks, body))
+    Some(sum_probe(base, &checks, body, attrs, globals))
 }
 
 // Числовой операнд верхнего сложения: String(base + …) → base из Num-узла.
@@ -1429,51 +1481,17 @@ fn metric_probe(inner: &Sx, fn_body: Option<&[Sx]>) -> Option<Probe> {
     })
 }
 
-// #jsa self-verification проба: guard'ы `return "NUM"` когда #jsa отсутствует,
-// финальный String([...getAttribute/hasOwnProperty...].reduce(+, NUM)). Челлендж
-// исполняется в main-page где #jsa нет → guard срабатывает → значение = guard-литерал.
-// Структура: querySelector("#jsa") в теле; значение — первый Str-литерал в return.
-fn jsa_probe(_inner: &Sx, fn_body: Option<&[Sx]>) -> Option<Probe> {
-    let body = fn_body?;
-    let mut is_jsa = false;
-    let mut guard: Option<String> = None;
-    harvest(body, &mut |s| {
-        if let Sx::Call { callee, args } = s
-            && let Sx::Member { prop, .. } = callee.as_ref()
-                && prop == "querySelector"
-                    && args.first().and_then(|a| match a {
-                        Sx::Str(t) => Some(t.as_str()),
-                        _ => None,
-                    }) == Some("#jsa")
-        {
-            is_jsa = true;
-        }
-        if guard.is_none()
-            && let Sx::Ret(Some(x)) = s
-                && let Sx::Str(t) = unseq_last(x)
-                    && t.chars().all(|c| c.is_ascii_digit())
-                        && !t.is_empty()
-        {
-            guard = Some(t.clone());
-        }
-    });
-    if !is_jsa {
-        return None;
-    }
-    let g = guard?;
-    let v: f64 = g.parse().ok()?;
-    Some(Probe {
-        reads: vec![Read::Env { desc: format!("#jsa guard → {g} [структурно]") }],
-        base: Some(v),
-        value: Some(v),
-    })
-}
-
 // Значение пробы = base + Σ Number(check). Каждый check решается структурно
 // (check_value по форме AST-узла). Любая нераспознанная форма → value=None,
 // честный отказ вместо угадывания. Никаких таблиц и снапшотов.
-fn sum_probe(base: f64, checks: &[Sx], fn_body: Option<&[Sx]>) -> Probe {
-    let ctx = probe_ctx(fn_body);
+fn sum_probe<'a>(
+    base: f64,
+    checks: &[Sx],
+    fn_body: Option<&[Sx]>,
+    attrs: &'a [(Box<str>, Box<str>)],
+    globals: &'a [Box<str>],
+) -> Probe {
+    let ctx = probe_ctx(fn_body, attrs, globals);
     let mut reads: Vec<Read> = Vec::new();
     let mut sum = base;
     let mut unsolvable = false;

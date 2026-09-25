@@ -163,6 +163,12 @@ fn cmd_facts(rest: &[String]) -> i32 {
     println!("timing.macrotask_zero    = {}", benv.timing.macrotask_zero);
     println!("fe_version_ok            = {}", benv.fe_version_ok);
     println!("dc_* events              = {}", benv.signal_events.len());
+    for (attr, val) in &benv.verify_attrs {
+        println!("verify.attr              = {attr}={val:?}");
+    }
+    for g in &benv.verify_globals {
+        println!("verify.global            = {g}");
+    }
     if let Some(st) = &benv.stack {
         println!("stack.fname              = {}", st.fname);
         println!("stack.line               = {}", st.line);

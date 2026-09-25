@@ -2,7 +2,7 @@ use crate::pipeline::flow;
 
 pub fn run(js: &[u8]) -> Result<String, flow::FlowErr> {
     let src = std::str::from_utf8(js).map_err(|_| flow::FlowErr::Parse("не UTF-8".into()))?;
-    let m = flow::run(src)?;
+    let m = flow::run(src, &[], &[])?;
     let mut out = String::with_capacity(8192);
     out.push_str("// duckkit 13 — деобфускация (oxc → const-prop → slice → egg)\n");
     out.push_str(&format!(

@@ -61,7 +61,7 @@ fn find_default_model(models_json: &[u8]) -> Option<String> {
     best
 }
 
-fn bundle_facts(page: &net::Page, bundle_js: &[u8]) -> Result<(StackFacts, Timing, Vec<Box<str>>, String), Err> {
+fn bundle_facts(page: &net::Page, bundle_js: &[u8]) -> Result<(StackFacts, Timing, Vec<Box<str>>, String, Vec<(Box<str>, Box<str>)>, Vec<Box<str>>), Err> {
     let bsrc = std::str::from_utf8(bundle_js).map_err(|_| Err::Metric("бандл не UTF-8".into()))?;
     let benv = analyze_bundle_cached(bsrc).ok_or(Err::Metric("бандл не парсится oxc".into()))?;
     let stack = benv.stack.ok_or(Err::Metric("стек не извлечён из бандла".into()))?;
@@ -69,7 +69,7 @@ fn bundle_facts(page: &net::Page, bundle_js: &[u8]) -> Result<(StackFacts, Timin
         return Err(Err::Metric("таймаут гонки jsa не найден в бандле".into()));
     }
     let bundle_url = format!("https://duck.ai/dist/duckai-dist/entry.duckai.{}.js", page.entry_bundle);
-    Ok((stack, benv.timing, benv.signal_events, bundle_url))
+    Ok((stack, benv.timing, benv.signal_events, bundle_url, benv.verify_attrs, benv.verify_globals))
 }
 
 impl Session {
@@ -77,8 +77,8 @@ impl Session {
         let http = Http::new(proxy)?;
         let page = http.page()?;
         let bundle_js = http.bundle(&page.entry_bundle)?;
-        let (stack, timing, signal_events, bundle_url) = bundle_facts(&page, &bundle_js)?;
-        let facts = Arc::new(Facts { stack, timing, origin: "https://duck.ai", bundle_url: bundle_url.clone() });
+        let (stack, timing, signal_events, bundle_url, verify_attrs, verify_globals) = bundle_facts(&page, &bundle_js)?;
+        let facts = Arc::new(Facts { stack, timing, origin: "https://duck.ai", bundle_url: bundle_url.clone(), verify_attrs, verify_globals });
         let mut journey_buf = [0u8; 32];
         net::journey_hex(&mut journey_buf)?;
         let journey = String::from_utf8_lossy(&journey_buf).into_owned();
@@ -196,10 +196,10 @@ impl Session {
         self.facts_reboots += 1;
         let page = self.http.page()?;
         let bundle_js = self.http.bundle(&page.entry_bundle)?;
-        let (stack, timing, signal_events, bundle_url) = bundle_facts(&page, &bundle_js)?;
+        let (stack, timing, signal_events, bundle_url, verify_attrs, verify_globals) = bundle_facts(&page, &bundle_js)?;
         self.bundle_url = bundle_url.clone();
         self.fe_version = page.fe_version();
-        self.facts = Arc::new(Facts { stack, timing, origin: "https://duck.ai", bundle_url });
+        self.facts = Arc::new(Facts { stack, timing, origin: "https://duck.ai", bundle_url, verify_attrs, verify_globals });
         self.signal_events = signal_events;
         eprintln!("[duckkit] факты бандла пересобраны ({})", self.bundle_url);
         Ok(())
@@ -245,7 +245,9 @@ impl Session {
                 Err(e) => return ChatOutcome::Err(e.to_string()),
             }
         };
-        if let Some(nc) = net::header_ci(&resp_headers, "x-vqd-hash-1") {
+        let next_challenge = net::header_ci(&resp_headers, "x-vqd-hash-1");
+        eprintln!("[duckkit] chat status={status} next_challenge={}", if next_challenge.is_some() { "yes" } else { "NO" });
+        if let Some(nc) = next_challenge {
             new_challenge = Some(nc.as_bytes().to_vec());
         }
         eprintln!("[duckkit] chat status={status}");
